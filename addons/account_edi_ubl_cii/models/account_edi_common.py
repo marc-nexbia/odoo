@@ -674,10 +674,18 @@ class AccountEdiCommon(models.AbstractModel):
         if invoice.message_main_attachment_id.mimetype == 'application/pdf':
             # Invoice look like it was already imported, don't import attachments again
             return attachments
-        additional_docs = tree.findall('./{*}AdditionalDocumentReference')
-        for document in additional_docs:
-            attachment_name = document.find('{*}ID')
-            attachment_data = document.find('{*}Attachment/{*}EmbeddedDocumentBinaryObject')
+        additional_docs = [
+            # UBL
+            (document.find('{*}ID'), document.find('{*}Attachment/{*}EmbeddedDocumentBinaryObject'))
+            for document in tree.findall('./{*}AdditionalDocumentReference')
+        ] + [
+            # CII
+            (document.find('{*}IssuerAssignedID'), document.find('{*}AttachmentBinaryObject'))
+            for document in tree.findall(
+                './{*}SupplyChainTradeTransaction/{*}ApplicableHeaderTradeAgreement/{*}AdditionalReferencedDocument'
+            )
+        ]
+        for attachment_name, attachment_data in additional_docs:
             if attachment_name is not None and attachment_data is not None:
                 mimetype = attachment_data.attrib.get('mimeCode')
                 if not (extension := SUPPORTED_FILE_TYPES.get(mimetype)) or not (text := ((attachment_data.text or '').strip())):
@@ -696,10 +704,13 @@ class AccountEdiCommon(models.AbstractModel):
                 })
                 # Upon receiving an email (containing an xml) with a configured alias to create invoice, the xml is
                 # set as the main_attachment. To be rendered in the form view, the pdf should be the main_attachment.
-                if invoice.message_main_attachment_id and \
-                        invoice.message_main_attachment_id.name.endswith('.xml') and \
-                        'pdf' not in invoice.message_main_attachment_id.mimetype and \
-                        mimetype == 'application/pdf':
+                if mimetype == 'application/pdf' and (
+                    not invoice.message_main_attachment_id
+                    or (
+                        invoice.message_main_attachment_id.name.endswith('.xml')
+                        and 'pdf' not in invoice.message_main_attachment_id.mimetype
+                    )
+                ):
                     invoice._message_set_main_attachment_id(attachment, force=True, filter_xml=False)
                 attachments |= attachment
 
@@ -1311,6 +1322,9 @@ class AccountEdiCommon(models.AbstractModel):
             ResPartner._import_retrieve_customer_from_name,
         ]
 
+    def _check_customer_endpoint_match(self, customer, peppol_eas, peppol_endpoint):
+        return customer.commercial_partner_id.peppol_eas == peppol_eas and customer.commercial_partner_id.peppol_endpoint == peppol_endpoint
+
     def _check_customer_vat_match(self, customer, vat, collected_values):
         """
         Compare the VAT from an EDI document against a partner's stored VAT:
@@ -1322,36 +1336,53 @@ class AccountEdiCommon(models.AbstractModel):
         country = self._import_retrieve_country(collected_values) or customer.country_id
         return self._vat_is_equal(customer.vat, vat, country)
 
-    def _import_create_missing_customer(self, collected_values):
+    def _import_check_retrieved_customer(self, collected_values):
+        """Check whether the retrieved customer matches the one described in the EDI document."""
         customer_values = collected_values['customer_values']
         logs = collected_values['logs']
-        customer = customer_values.get('customer')
-
+        customer = customer_values['customer']
         name = customer_values.get('name')
         vat = customer_values.get('vat')
+
+        sender_eas = customer_values.get('sender_eas')
+        sender_endpoint = customer_values.get('sender_endpoint')
+
+        if vat:
+            country = self._import_retrieve_country(collected_values)
+            if not customer.vat:
+                customer.vat, _country_code = self.env['res.partner']._run_vat_checks(country, vat, validation='setnull')
+            else:
+                country_mismatch = bool(country and customer.country_id and customer.country_id != country)
+                if country_mismatch or not self._check_customer_vat_match(customer, vat, collected_values):
+                    logs.append(_("Could not retrieve a partner corresponding to '%s' with the same VAT and country. A new partner was created.", name))
+                    return False
+
+        if sender_eas and sender_endpoint:
+            if not customer.commercial_partner_id.peppol_eas and not customer.commercial_partner_id.peppol_endpoint:
+                customer.commercial_partner_id.peppol_eas = sender_eas
+                customer.commercial_partner_id.peppol_endpoint = sender_endpoint
+            elif not self._check_customer_endpoint_match(customer, sender_eas, sender_endpoint):
+                logs.append(_("Could not retrieve a partner corresponding to '%s' with the same endpoint. A new partner was created.", name))
+                return False
+        return True
+
+    def _import_create_missing_customer(self, collected_values):
+        customer_values = collected_values['customer_values']
+        customer = customer_values.get('customer')
+        name = customer_values.get('name')
+        logs = collected_values['logs']
+
         if not name:
             return
 
-        vat_mismatch = False
         if customer:
-            if vat:
-                country = self._import_retrieve_country(collected_values)
-                if not customer.vat:
-                    customer.vat, _country_code = self.env['res.partner']._run_vat_checks(country, vat, validation='setnull')
-                    return
-                country_mismatch = bool(country and customer.country_id and customer.country_id != country)
-                if not country_mismatch and self._check_customer_vat_match(customer, vat, collected_values):
-                    return
-                vat_mismatch = True
-            else:
+            if self._import_check_retrieved_customer(collected_values):
                 return
+        else:
+            logs.append(_("Could not retrieve a partner corresponding to '%s'. A new partner was created.", name))
 
         partner_create_values = self._import_prepare_missing_customer_create_values(collected_values)
         customer = self.env['res.partner'].create(partner_create_values)
-        if vat_mismatch:
-            logs.append(_("Could not retrieve a partner corresponding to '%s' with the same VAT and country. A new partner was created.", name))
-        else:
-            logs.append(_("Could not retrieve a partner corresponding to '%s'. A new partner was created.", name))
         customer_values['customer'] = customer
         collected_values['to_write']['partner_id'] = customer.id
 
@@ -1890,7 +1921,7 @@ class AccountEdiCommon(models.AbstractModel):
         # Collect the embedded documents.
         invoice = collected_values['invoice']
         source_attachment = collected_values['file_data']['attachment'] or self.env['ir.attachment']
-        attachments = source_attachment + self._import_attachments(invoice, collected_values['tree'])
+        attachments = source_attachment + self._generate_pdf_attachment(invoice, collected_values['tree'])
 
         # Chatter.
         body = Markup("<strong>%s</strong>") % self.env._(
